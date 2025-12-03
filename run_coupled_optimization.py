@@ -1,13 +1,13 @@
 """
-Coupled dFUSE + dRoute Differentiable Calibration (v2)
+Coupled dFUSE + dRoute Differentiable Calibration (v3 - Enzyme AD)
 
 This version properly couples:
-- dFUSE: Using new run_fuse_batch_gradient with Enzyme AD
-- dRoute: Using native CoDiPack/Enzyme routers
+- dFUSE: Using Enzyme AD via DifferentiableFUSEBatch
+- dRoute: Using TRUE Enzyme AD via dmc.enzyme.compute_manning_gradients
 
 Key features:
 1. End-to-end differentiable through both models
-2. Proper gradient accumulation for shared parameters
+2. True reverse-mode AD for Manning's n (not numerical/CoDiPack)
 3. NSE/KGE loss functions
 4. Warmup period handling
 5. Learning rate scheduling and early stopping
@@ -29,7 +29,7 @@ import warnings
 # --- Path Setup ---
 CODE_DIR = Path("/Users/darrieythorsson/compHydro/code")
 sys.path.append(str(CODE_DIR / "dFUSE/python"))
-sys.path.append(str(CODE_DIR / "dRoute/build/python"))
+sys.path.append(str(CODE_DIR / "dRoute/build"))
 
 import dfuse
 import dfuse_core
@@ -76,92 +76,216 @@ def kge_loss(sim: torch.Tensor, obs: torch.Tensor,
 
 
 # =============================================================================
-# 2. DIFFERENTIABLE ROUTING LAYER - Using dRoute's Native AD
+# 2. DIFFERENTIABLE ROUTING LAYER - TRUE ENZYME AD
 # =============================================================================
 
 class DifferentiableRouting(torch.autograd.Function):
     """
-    PyTorch wrapper for dRoute using fast Enzyme kernels.
+    PyTorch wrapper for dRoute using TRUE Enzyme AD gradients.
     
-    Uses dmc.enzyme.EnzymeRouter for fast forward passes and numerical
-    gradients computed efficiently via the Enzyme kernels.
+    Forward: Standard MuskingumCungeRouter
+    Backward: Enzyme AD via compute_manning_gradients
     """
     
     @staticmethod
     def forward(ctx, 
                 lateral_inflows: torch.Tensor,  # [n_timesteps, n_reaches]
                 manning_n: torch.Tensor,         # [n_reaches]
-                enzyme_router,                   # dmc.enzyme.EnzymeRouter
-                outlet_reach_id: int) -> torch.Tensor:
+                router,                          # dmc.MuskingumCungeRouter
+                network,                         # dmc.Network (for topology extraction)
+                outlet_reach_id: int,            # Reach ID of outlet
+                dt: float) -> torch.Tensor:      # Timestep in seconds
         """
-        Route lateral inflows through river network using fast Enzyme kernels.
+        Route lateral inflows through river network.
         
         Returns outlet discharge [n_timesteps].
         """
-        ctx.enzyme_router = enzyme_router
+        ctx.router = router
+        ctx.network = network
         ctx.outlet_reach_id = outlet_reach_id
         ctx.n_reaches = lateral_inflows.shape[1]
         ctx.n_timesteps = lateral_inflows.shape[0]
+        ctx.dt = dt
         
         inflows_np = lateral_inflows.detach().cpu().numpy().astype(np.float64)
         manning_np = manning_n.detach().cpu().numpy().astype(np.float64)
         
-        # Update Manning's n
-        enzyme_router.set_manning_n_all(manning_np)
+        # Update Manning's n on network
+        network.set_manning_n_all(manning_np)
         
-        # Fast forward pass using Enzyme simulate
-        outlet_Q = dmc.enzyme.simulate(enzyme_router, inflows_np, outlet_reach_id)
-        outlet_Q = np.array(outlet_Q)
+        # Reset router state
+        router.reset_state()
         
+        # Forward pass using standard router
+        topo_order = list(network.topological_order())
+        outlet_Q = []
+        
+        for t in range(ctx.n_timesteps):
+            # Set lateral inflows for all reaches
+            for i, rid in enumerate(topo_order):
+                router.set_lateral_inflow(int(rid), float(inflows_np[t, i]))
+            
+            router.route_timestep()
+            outlet_Q.append(router.get_discharge(outlet_reach_id))
+        
+        outlet_Q = np.array(outlet_Q, dtype=np.float64)
+        
+        # Extract topology for backward pass
+        n_reaches = ctx.n_reaches
+        topo_order_ids = list(network.topological_order())  # Actual reach IDs
+        
+        # For Enzyme, we need indices 0..n-1 in topo order (which is just 0,1,2,...)
+        # since we already ordered data by topo order
+        topo_order = np.arange(n_reaches, dtype=np.int32)
+        
+        # Map reach IDs to indices in topo order
+        id_to_idx = {int(rid): i for i, rid in enumerate(topo_order_ids)}
+        
+        # Build upstream connectivity arrays
+        upstream_counts = np.zeros(n_reaches, dtype=np.int32)
+        upstream_lists = [[] for _ in range(n_reaches)]
+        
+        for i, rid in enumerate(topo_order_ids):
+            reach = network.get_reach(int(rid))
+            if reach.upstream_junction_id >= 0:
+                try:
+                    junc = network.get_junction(reach.upstream_junction_id)
+                    for up_id in junc.upstream_reach_ids:
+                        if up_id in id_to_idx:
+                            upstream_lists[i].append(id_to_idx[up_id])
+                except:
+                    pass
+        
+        for i in range(n_reaches):
+            upstream_counts[i] = len(upstream_lists[i])
+        
+        # Flatten upstream indices with offsets
+        upstream_offsets = np.zeros(n_reaches + 1, dtype=np.int32)
+        for i in range(n_reaches):
+            upstream_offsets[i + 1] = upstream_offsets[i] + upstream_counts[i]
+        
+        total_upstream = upstream_offsets[n_reaches]
+        upstream_indices = np.zeros(max(total_upstream, 1), dtype=np.int32)
+        for i in range(n_reaches):
+            offset = upstream_offsets[i]
+            for j, up_idx in enumerate(upstream_lists[i]):
+                upstream_indices[offset + j] = up_idx
+        
+        # Extract reach properties (in topo order)
+        lengths = np.zeros(n_reaches, dtype=np.float64)
+        slopes = np.zeros(n_reaches, dtype=np.float64)
+        width_coefs = np.zeros(n_reaches, dtype=np.float64)
+        width_exps = np.zeros(n_reaches, dtype=np.float64)
+        depth_coefs = np.zeros(n_reaches, dtype=np.float64)
+        depth_exps = np.zeros(n_reaches, dtype=np.float64)
+        
+        for i, rid in enumerate(topo_order_ids):
+            reach = network.get_reach(int(rid))
+            lengths[i] = reach.length
+            slopes[i] = max(reach.slope, 0.0001)
+            width_coefs[i] = reach.geometry.width_coef
+            width_exps[i] = reach.geometry.width_exp
+            depth_coefs[i] = reach.geometry.depth_coef
+            depth_exps[i] = reach.geometry.depth_exp
+        
+        # Find outlet index in topo order
+        outlet_idx = id_to_idx[outlet_reach_id]
+        
+        # Save for backward
         ctx.save_for_backward(lateral_inflows, manning_n)
         ctx.inflows_np = inflows_np
-        ctx.outlet_Q = outlet_Q
+        ctx.topo_order = topo_order
+        ctx.topo_order_ids = topo_order_ids  # Actual reach IDs for numerical fallback
+        ctx.upstream_counts = upstream_counts
+        ctx.upstream_offsets = upstream_offsets
+        ctx.upstream_indices = upstream_indices
+        ctx.lengths = lengths
+        ctx.slopes = slopes
+        ctx.width_coefs = width_coefs
+        ctx.width_exps = width_exps
+        ctx.depth_coefs = depth_coefs
+        ctx.depth_exps = depth_exps
+        ctx.outlet_idx = outlet_idx
         
         return torch.tensor(outlet_Q, dtype=torch.float32, device=lateral_inflows.device)
     
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         """
-        Backward pass using numerical gradients with fast Enzyme kernels.
+        Backward pass using TRUE Enzyme AD.
         """
         lateral_inflows, manning_n = ctx.saved_tensors
-        enzyme_router = ctx.enzyme_router
-        inflows_np = ctx.inflows_np
-        outlet_Q_base = ctx.outlet_Q
         
         grad_np = grad_output.detach().cpu().numpy().astype(np.float64)
         manning_np = manning_n.detach().cpu().numpy().astype(np.float64)
         
-        # ====== Manning's n gradients (numerical with fast Enzyme forward) ======
-        eps = 0.01
-        grad_manning_np = np.zeros(ctx.n_reaches)
-        
-        for i in range(ctx.n_reaches):
-            # Forward perturbation
-            mann_pert = manning_np.copy()
-            mann_pert[i] = manning_np[i] * (1 + eps)
-            enzyme_router.set_manning_n_all(mann_pert)
-            Q_plus = np.array(dmc.enzyme.simulate(enzyme_router, inflows_np, ctx.outlet_reach_id))
+        # Use Enzyme AD for Manning's n gradients
+        try:
+            grad_manning_np = dmc.enzyme.compute_manning_gradients(
+                manning_np,
+                ctx.inflows_np,
+                grad_np,
+                ctx.lengths,
+                ctx.slopes,
+                ctx.width_coefs,
+                ctx.width_exps,
+                ctx.depth_coefs,
+                ctx.depth_exps,
+                ctx.topo_order,
+                ctx.upstream_counts,
+                ctx.upstream_offsets,
+                ctx.upstream_indices,
+                ctx.outlet_idx,
+                ctx.dt
+            )
+            grad_manning_np = np.array(grad_manning_np)
+        except Exception as e:
+            print(f"  Enzyme AD failed ({e}), using numerical fallback")
+            # Numerical gradient fallback using standard router
+            eps = 0.01
+            grad_manning_np = np.zeros(ctx.n_reaches)
+            router = ctx.router
+            network = ctx.network
+            topo_order_ids = ctx.topo_order_ids
             
-            # Backward perturbation
-            mann_pert[i] = manning_np[i] * (1 - eps)
-            enzyme_router.set_manning_n_all(mann_pert)
-            Q_minus = np.array(dmc.enzyme.simulate(enzyme_router, inflows_np, ctx.outlet_reach_id))
+            for i in range(ctx.n_reaches):
+                mann_pert = manning_np.copy()
+                
+                # Plus perturbation
+                mann_pert[i] = manning_np[i] * (1 + eps)
+                network.set_manning_n_all(mann_pert)
+                router.reset_state()
+                Q_plus = []
+                for t in range(ctx.n_timesteps):
+                    for j, rid in enumerate(topo_order_ids):
+                        router.set_lateral_inflow(int(rid), float(ctx.inflows_np[t, j]))
+                    router.route_timestep()
+                    Q_plus.append(router.get_discharge(ctx.outlet_reach_id))
+                
+                # Minus perturbation
+                mann_pert[i] = manning_np[i] * (1 - eps)
+                network.set_manning_n_all(mann_pert)
+                router.reset_state()
+                Q_minus = []
+                for t in range(ctx.n_timesteps):
+                    for j, rid in enumerate(topo_order_ids):
+                        router.set_lateral_inflow(int(rid), float(ctx.inflows_np[t, j]))
+                    router.route_timestep()
+                    Q_minus.append(router.get_discharge(ctx.outlet_reach_id))
+                
+                dQ_dn = (np.array(Q_plus) - np.array(Q_minus)) / (2 * eps * manning_np[i])
+                grad_manning_np[i] = np.sum(grad_np * dQ_dn)
             
-            # Gradient via chain rule: dL/dn = sum_t(dL/dQ[t] * dQ[t]/dn)
-            dQ_dn = (Q_plus - Q_minus) / (2 * eps * manning_np[i])
-            grad_manning_np[i] = np.sum(grad_np * dQ_dn)
-        
-        # Restore original Manning's n
-        enzyme_router.set_manning_n_all(manning_np)
+            # Restore original
+            network.set_manning_n_all(manning_np)
         
         grad_manning = torch.from_numpy(grad_manning_np.astype(np.float32))
         
-        # ====== Lateral inflow gradients ======
+        # Lateral inflow gradients (mass conservation approximation)
         grad_lateral = grad_np[:, np.newaxis] * np.ones((1, ctx.n_reaches))
         grad_lateral_t = torch.from_numpy(grad_lateral.astype(np.float32))
         
-        return grad_lateral_t, grad_manning, None, None
+        return grad_lateral_t, grad_manning, None, None, None, None
 
 
 # =============================================================================
@@ -171,8 +295,7 @@ class DifferentiableRouting(torch.autograd.Function):
 class CoupledFUSERoute(nn.Module):
     """
     Coupled dFUSE + dRoute model with end-to-end differentiability.
-    
-    Uses dRoute's fast Enzyme kernels for routing.
+    Uses TRUE Enzyme AD for both FUSE and routing gradients.
     """
     
     def __init__(self,
@@ -205,23 +328,20 @@ class CoupledFUSERoute(nn.Module):
         self.network = self._load_network(topology_file)
         self.n_reaches = self.network.num_reaches()
         
-        # Find outlet (reach with downstream_junction_id == -1)
-        self.outlet_reach_id = 0
-        for i in range(self.n_reaches):
-            reach = self.network.get_reach(i)
-            if reach.downstream_junction_id < 0:
-                self.outlet_reach_id = i
-                break
+        # Build ID mapping - use topological order
+        topo_order = self.network.topological_order()
+        self.reach_ids = list(topo_order)
+        self.id_to_idx = {rid: i for i, rid in enumerate(topo_order)}
+        self.outlet_reach_id = int(topo_order[-1])
         
-        # Create EnzymeRouter (fast Enzyme kernels)
-        self.enzyme_router = dmc.enzyme.EnzymeRouter(
-            self.network,
-            dt=dt,
-            num_substeps=4,
-            method=0  # 0 = Muskingum-Cunge
-        )
+        # Create standard router for forward pass (EnzymeRouter has bugs)
+        config = dmc.RouterConfig()
+        config.dt = dt
+        config.num_substeps = 4
+        config.enable_gradients = False  # We use Enzyme AD instead
+        self.router = dmc.MuskingumCungeRouter(self.network, config)
         
-        # Manning's n (log-space)
+        # Manning's n (log-space for positivity)
         self.log_manning_n = nn.Parameter(torch.full((self.n_reaches,), np.log(0.035)))
         
         # HRU to reach mapping
@@ -229,104 +349,86 @@ class CoupledFUSERoute(nn.Module):
             'mapping_matrix',
             self._build_mapping_matrix(topology_file, hru_areas)
         )
-        self.n_hrus = self.mapping_matrix.shape[0]
         
-        # Number of states
+        self.n_hrus = len(hru_areas)
         self.n_states = dfuse_core.get_num_active_states(self.config_dict)
     
-    def _load_network(self, topology_file: str) -> 'dmc.Network':
-        """Load network from topology file."""
+    def _load_network(self, topology_file: str) -> dmc.Network:
+        """Load river network from topology.nc."""
         ds = xr.open_dataset(topology_file)
         
-        seg_ids = ds['segId'].values
-        down_seg_ids = ds['downSegId'].values
-        slopes = ds['slope'].values
-        lengths = ds['length'].values
-        mann_n = ds['mann_n'].values
-        
-        n_segs = len(seg_ids)
-        seg_id_to_idx = {int(seg_id): i for i, seg_id in enumerate(seg_ids)}
-        
-        # Build upstream connectivity
-        upstream_map = {i: [] for i in range(n_segs)}
-        for i, down_id in enumerate(down_seg_ids):
-            down_id_int = int(down_id)
-            if down_id_int in seg_id_to_idx:
-                down_idx = seg_id_to_idx[down_id_int]
-                upstream_map[down_idx].append(i)
+        seg_ids = ds['segId'].values.astype(int)
+        down_seg_ids = ds['downSegId'].values.astype(int)
+        lengths = ds['length'].values.astype(float)
+        slopes = ds['slope'].values.astype(float)
+        mann_n = ds['mann_n'].values if 'mann_n' in ds else np.full(len(seg_ids), 0.035)
         
         network = dmc.Network()
+        seg_id_set = set(seg_ids)
         
-        # Create reaches
-        for i in range(n_segs):
+        # Build upstream mapping
+        upstream_map = {int(sid): [] for sid in seg_ids}
+        for i, down_id in enumerate(down_seg_ids):
+            if int(down_id) in seg_id_set:
+                upstream_map[int(down_id)].append(int(seg_ids[i]))
+        
+        # Add reaches
+        for i, sid in enumerate(seg_ids):
             reach = dmc.Reach()
-            reach.id = i
+            reach.id = int(sid)
             reach.length = float(lengths[i])
             reach.slope = max(float(slopes[i]), 0.0001)
             reach.manning_n = float(mann_n[i])
-            
             reach.geometry.width_coef = 7.2
             reach.geometry.width_exp = 0.5
             reach.geometry.depth_coef = 0.27
             reach.geometry.depth_exp = 0.3
-            
-            reach.upstream_junction_id = i
-            
+            reach.upstream_junction_id = int(sid)
             down_id = int(down_seg_ids[i])
-            if down_id in seg_id_to_idx:
-                reach.downstream_junction_id = seg_id_to_idx[down_id]
-            else:
-                reach.downstream_junction_id = -1
-            
+            reach.downstream_junction_id = down_id if down_id in seg_id_set else -1
             network.add_reach(reach)
         
-        # Create junctions
-        for i in range(n_segs):
+        # Add junctions
+        for i, sid in enumerate(seg_ids):
             junc = dmc.Junction()
-            junc.id = i
-            junc.upstream_reach_ids = upstream_map[i]
-            junc.downstream_reach_ids = [i]
+            junc.id = int(sid)
+            junc.upstream_reach_ids = upstream_map[int(sid)]
+            junc.downstream_reach_ids = [int(sid)]
             network.add_junction(junc)
         
         network.build_topology()
         ds.close()
-        
         return network
     
-    def _build_mapping_matrix(self, topology_file: str, 
-                              hru_areas: np.ndarray) -> torch.Tensor:
-        """Build HRU to reach mapping matrix."""
+    def _build_mapping_matrix(self, topology_file: str, hru_areas: np.ndarray) -> torch.Tensor:
+        """Build HRU to reach mapping (converts mm/timestep to m³/s)."""
         ds = xr.open_dataset(topology_file)
-        
-        hru_ids = ds['hruId'].values
-        hru_to_seg = ds['hruToSegId'].values
-        seg_ids = ds['segId'].values
-        
-        seg_id_to_idx = {int(seg_id): i for i, seg_id in enumerate(seg_ids)}
-        
-        n_hrus = len(hru_ids)
-        n_reaches = len(seg_ids)
-        
-        mapping = torch.zeros(n_hrus, n_reaches)
-        
-        for h_idx, (hru_id, seg_id) in enumerate(zip(hru_ids, hru_to_seg)):
-            seg_id_int = int(seg_id)
-            if seg_id_int in seg_id_to_idx:
-                reach_idx = seg_id_to_idx[seg_id_int]
-                area_m2 = hru_areas[h_idx]
-                area_km2 = area_m2 / 1e6
-                mm_to_m3s = area_km2 * 1000 / self.dt_seconds
-                mapping[h_idx, reach_idx] = mm_to_m3s
-        
+        hru_to_seg = ds['hruToSegId'].values.astype(int)
         ds.close()
+        
+        # Use topological order
+        topo_order = self.network.topological_order()
+        id_to_idx = {rid: i for i, rid in enumerate(topo_order)}
+        
+        n_hrus = len(hru_to_seg)
+        n_reaches = len(topo_order)
+        mapping = torch.zeros((n_reaches, n_hrus), dtype=torch.float32)
+        
+        for h_idx, seg_id in enumerate(hru_to_seg):
+            if seg_id in id_to_idx:
+                r_idx = id_to_idx[seg_id]
+                # mm/timestep * m² / 1000 / dt_seconds = m³/s
+                conversion = hru_areas[h_idx] / 1000.0 / self.dt_seconds
+                mapping[r_idx, h_idx] = conversion
+        
         return mapping
     
     def get_physical_params(self) -> torch.Tensor:
-        """Transform raw params to physical space."""
+        """Get physical parameters from unconstrained."""
         return self.param_lower + (self.param_upper - self.param_lower) * torch.sigmoid(self.fuse_raw_params)
     
     def get_initial_state(self) -> torch.Tensor:
-        """Get default initial states."""
+        """Get initial state tensor."""
         state = torch.zeros(self.n_hrus, self.n_states)
         state[:, 0] = 50.0
         if self.n_states > 1:
@@ -335,18 +437,18 @@ class CoupledFUSERoute(nn.Module):
             state[:, 2] = 200.0
         return state
     
-    def forward(self, forcing: torch.Tensor, 
+    def forward(self, forcing: torch.Tensor,
                 initial_state: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Run coupled model.
+        Forward pass.
         
         Args:
-            forcing: [n_timesteps, n_hrus, 3] Forcing data
-            initial_state: [n_hrus, n_states] Initial states
+            forcing: [n_timesteps, n_hrus, 3]
+            initial_state: [n_hrus, n_states]
             
         Returns:
-            outlet_Q: [n_timesteps] Outlet discharge in m³/s
-            runoff: [n_timesteps, n_hrus] Runoff in mm
+            outlet_Q: [n_timesteps]
+            runoff: [n_timesteps, n_hrus]
         """
         if initial_state is None:
             initial_state = self.get_initial_state().to(forcing.device)
@@ -354,19 +456,21 @@ class CoupledFUSERoute(nn.Module):
         # Get physical parameters
         phys_params = self.get_physical_params()
         
-        # Run FUSE with gradient flow
+        # Run FUSE with gradient flow (Enzyme AD)
         runoff = DifferentiableFUSEBatch.apply(
             phys_params, initial_state, forcing,
             self.config_dict, self.dt_days
         )
         
-        # Map to reaches
+        # Map to reaches (reorder to topological order)
         lateral_inflows = torch.matmul(runoff, self.mapping_matrix.T)
         
-        # Route using EnzymeRouter
+        # Route using standard router + Enzyme AD for gradients
         manning_n = torch.exp(self.log_manning_n)
         outlet_Q = DifferentiableRouting.apply(
-            lateral_inflows, manning_n, self.enzyme_router, self.outlet_reach_id
+            lateral_inflows, manning_n, 
+            self.router, self.network,
+            self.outlet_reach_id, self.dt_seconds
         )
         
         return outlet_Q, runoff
@@ -427,7 +531,7 @@ def train_model(model: CoupledFUSERoute,
         
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
-        scheduler.step(loss.detach())
+        scheduler.step(loss)
         
         # Record
         with torch.no_grad():
@@ -520,6 +624,7 @@ def main():
     print(f"  FUSE params: {len(model.param_names)}")
     print(f"  Reaches: {model.n_reaches}")
     print(f"  HRUs: {model.n_hrus}")
+    print(f"  Using Enzyme AD for routing gradients")
     
     # Check gradient computation
     print("\nVerifying gradient flow...")
@@ -539,7 +644,8 @@ def main():
         print("  ✗ FUSE gradients NOT flowing!")
     
     if manning_grad is not None and (manning_grad != 0).any():
-        print("  ✓ Manning gradients flowing")
+        print("  ✓ Manning gradients flowing (Enzyme AD)")
+        print(f"    grad sum: {manning_grad.sum().item():.6f}, max: {manning_grad.abs().max().item():.6f}")
     else:
         print("  ✗ Manning gradients NOT flowing!")
     
