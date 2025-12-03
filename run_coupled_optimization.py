@@ -1307,8 +1307,8 @@ def main():
         forcing=forcing,
         observed=observed,
         n_epochs=600,           # More epochs for complex loss
-        lr=0.05,                # Learning rate
-        loss_fn='kge_loss',       # NSE + log-NSE + peak-weighted
+        lr=0.025,                # Learning rate
+        loss_fn='triple',       # NSE + log-NSE + peak-weighted
         alpha=0.6,              # Not used for triple, but kept for reference
         spatial_reg=0.0005,     # Slightly less regularization
         verbose=True

@@ -94,6 +94,14 @@ cd DODO
 
 ## Quick Start
 
+To run the example:
+
+```
+python run_coupled_optimization.py
+```
+
+To use in workflows:
+
 ```python
 from run_coupled_optimization import CoupledFUSERoute, train_model, load_data
 import dfuse
