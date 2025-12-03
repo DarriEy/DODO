@@ -1,9 +1,5 @@
 # DODO: Differentiable Optimization of Distributed Outflow
 
-<p align="center">
-  <img src="docs/images/dodo_logo.png" alt="DODO Logo" width="200"/>
-</p>
-
 **DODO** is an end-to-end differentiable framework for calibrating distributed hydrological models with river routing. It couples [dFUSE](https://github.com/DarriEy/dFUSE) (differentiable FUSE) with [dRoute](https://github.com/DarriEy/dRoute) (differentiable Muskingum-Cunge routing) to enable gradient-based optimization of both rainfall-runoff parameters and channel routing parameters simultaneously.
 
 ## Key Features
@@ -14,16 +10,6 @@
 - **Multiple loss functions**: NSE, log-NSE, KGE, peak-weighted, and combined objectives for balanced calibration
 - **PyTorch integration**: Seamless integration with PyTorch optimizers, schedulers, and ecosystem
 
-## Performance
-
-Calibration results on Bow River at Banff (29 HRUs, 5 years):
-
-| Metric | Value |
-|--------|-------|
-| NSE | 0.734 |
-| KGE | 0.814 |
-| log-NSE | 0.779 |
-| peak-NSE | 0.759 |
 
 ## Architecture
 
