@@ -216,8 +216,248 @@ def triple_objective_loss(sim: torch.Tensor, obs: torch.Tensor,
 
 
 # =============================================================================
-# 2. DIFFERENTIABLE ROUTING LAYER - TRUE ENZYME AD
+# 2. DIFFERENTIABLE ROUTING LAYERS
 # =============================================================================
+
+# Routing method configurations
+# Format: (router_class_name, supports_gradients, gradient_method, config_class)
+# gradient_method: 'enzyme' = use Enzyme AD, 'native' = use router's built-in AD, 
+#                  'sve' = Saint-Venant specific gradient API, None = forward-only
+ROUTING_METHOD_INFO = {
+    'muskingum_cunge': ('MuskingumCungeRouter', True, 'enzyme', 'RouterConfig'),
+    'diffusive_wave': ('DiffusiveWaveRouter', True, 'native', 'RouterConfig'),    # Diffusive wave approx
+    'diffusive_wave_ift': ('DiffusiveWaveIFT', True, 'native', 'RouterConfig'),   # Diffusive wave with IFT adjoint
+    'irf': ('IRFRouter', True, 'native', 'RouterConfig'),                          # Impulse Response Function
+    'kwt_soft': ('SoftGatedKWT', True, 'native', 'RouterConfig'),                  # Differentiable KWT
+    'saint_venant': ('SaintVenantRouter', True, 'sve', 'SaintVenantConfig'),       # Full dynamic Saint-Venant
+    'lag': ('LagRouter', False, None, 'RouterConfig'),                             # Forward-only
+    'kwt': ('KWTRouter', False, None, 'RouterConfig'),                             # Forward-only
+}
+
+
+class DifferentiableRoutingNative(torch.autograd.Function):
+    """
+    PyTorch wrapper for dRoute routers using their native gradient computation.
+    
+    Works with: IRFRouter, DiffusiveWaveRouter, DiffusiveWaveIFT, SoftGatedKWT
+    
+    These routers have built-in gradient computation via:
+    - start_recording() / stop_recording()
+    - compute_gradients(gauge_reaches, dL_dQ)
+    - get_gradients() -> dict
+    """
+    
+    @staticmethod
+    def forward(ctx, 
+                lateral_inflows: torch.Tensor,  # [n_timesteps, n_reaches]
+                manning_n: torch.Tensor,         # [n_reaches]
+                router,                          # Any gradient-capable router
+                network,                         # dmc.Network
+                outlet_reach_id: int,            # Reach ID of outlet
+                dt: float,                       # Timestep in seconds
+                topo_order_ids: list) -> torch.Tensor:
+        """
+        Route lateral inflows through river network.
+        
+        Returns outlet discharge [n_timesteps].
+        """
+        ctx.router = router
+        ctx.network = network
+        ctx.outlet_reach_id = outlet_reach_id
+        ctx.n_reaches = lateral_inflows.shape[1]
+        ctx.n_timesteps = lateral_inflows.shape[0]
+        ctx.dt = dt
+        ctx.topo_order_ids = topo_order_ids
+        
+        inflows_np = lateral_inflows.detach().cpu().numpy().astype(np.float64)
+        manning_np = manning_n.detach().cpu().numpy().astype(np.float64)
+        
+        # Update Manning's n on network
+        network.set_manning_n_all(manning_np)
+        
+        # Reset router state and start recording for gradient computation
+        router.reset_state()
+        router.enable_gradients(True)
+        router.start_recording()
+        
+        # Forward pass
+        outlet_Q = []
+        for t in range(ctx.n_timesteps):
+            for i, rid in enumerate(topo_order_ids):
+                router.set_lateral_inflow(int(rid), float(inflows_np[t, i]))
+            router.route_timestep()
+            outlet_Q.append(router.get_discharge(outlet_reach_id))
+        
+        router.stop_recording()
+        
+        outlet_Q = np.array(outlet_Q, dtype=np.float64)
+        
+        # Save for backward
+        ctx.save_for_backward(lateral_inflows, manning_n)
+        ctx.inflows_np = inflows_np
+        
+        return torch.tensor(outlet_Q, dtype=torch.float32, device=lateral_inflows.device)
+    
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """
+        Backward pass using router's native gradient computation.
+        """
+        lateral_inflows, manning_n = ctx.saved_tensors
+        
+        grad_np = grad_output.detach().cpu().numpy().astype(np.float64)
+        
+        # Compute gradients using router's native AD
+        # dL_dQ is the gradient of loss w.r.t. each output timestep
+        # We sum them to get the total gradient contribution
+        ctx.router.compute_gradients([ctx.outlet_reach_id], [float(grad_np.sum())])
+        
+        # Get gradients from router (dict: 'reach_X_manning_n' -> value)
+        grads_dict = ctx.router.get_gradients()
+        
+        # Map back to tensor in topological order
+        grad_manning_np = np.zeros(ctx.n_reaches, dtype=np.float64)
+        for i, rid in enumerate(ctx.topo_order_ids):
+            key = f"reach_{rid}_manning_n"
+            if key in grads_dict:
+                grad_manning_np[i] = grads_dict[key]
+        
+        grad_manning = torch.from_numpy(grad_manning_np.astype(np.float32))
+        
+        # Lateral inflow gradients (mass conservation approximation)
+        grad_lateral = grad_np[:, np.newaxis] * np.ones((1, ctx.n_reaches))
+        grad_lateral_t = torch.from_numpy(grad_lateral.astype(np.float32))
+        
+        # Reset router gradients for next iteration
+        ctx.router.reset_gradients()
+        
+        return grad_lateral_t, grad_manning, None, None, None, None, None
+
+
+class DifferentiableRoutingSaintVenant(torch.autograd.Function):
+    """
+    PyTorch wrapper for the full dynamic Saint-Venant router.
+    
+    The Saint-Venant router solves the full 1D shallow water equations:
+    - Continuity: ∂A/∂t + ∂Q/∂x = q_lat
+    - Momentum: ∂Q/∂t + ∂(Q²/A)/∂x + gA∂h/∂x = gA(S₀ - Sf)
+    
+    Uses numerical gradients via finite difference on Manning's n.
+    
+    NOTE: Saint-Venant is computationally expensive and can be numerically
+    challenging for daily timesteps. Consider using 'diffusive_wave' for
+    faster, more stable daily routing.
+    """
+    
+    @staticmethod
+    def forward(ctx, 
+                lateral_inflows: torch.Tensor,  # [n_timesteps, n_reaches]
+                manning_n: torch.Tensor,         # [n_reaches]
+                router,                          # dmc.SaintVenantRouter
+                network,                         # dmc.Network
+                outlet_reach_id: int,            # Reach ID of outlet
+                dt: float,                       # Timestep in seconds
+                topo_order_ids: list) -> torch.Tensor:
+        """
+        Route lateral inflows through river network using Saint-Venant equations.
+        
+        Returns outlet discharge [n_timesteps].
+        """
+        ctx.router = router
+        ctx.network = network
+        ctx.outlet_reach_id = outlet_reach_id
+        ctx.n_reaches = lateral_inflows.shape[1]
+        ctx.n_timesteps = lateral_inflows.shape[0]
+        ctx.dt = dt
+        ctx.topo_order_ids = topo_order_ids
+        
+        inflows_np = lateral_inflows.detach().cpu().numpy().astype(np.float64)
+        manning_np = manning_n.detach().cpu().numpy().astype(np.float64)
+        
+        # Ensure inflows are non-negative (SVE can struggle with negative values)
+        inflows_np = np.maximum(inflows_np, 0.0)
+        
+        # Update Manning's n on network
+        network.set_manning_n_all(manning_np)
+        
+        # Reset router state
+        router.reset_state()
+        
+        # Start recording for gradient computation
+        router.start_recording()
+        
+        # Forward pass - route and record outputs
+        outlet_Q = []
+        last_valid_Q = 0.1  # Fallback value
+        n_errors = 0
+        
+        for t in range(ctx.n_timesteps):
+            for i, rid in enumerate(topo_order_ids):
+                # Ensure minimum inflow to prevent dry bed
+                inflow = max(float(inflows_np[t, i]), 1e-6)
+                router.set_lateral_inflow(int(rid), inflow)
+            
+            router.route_timestep()
+            router.record_output(outlet_reach_id)
+            
+            Q = router.get_discharge(outlet_reach_id)
+            
+            # Check for NaN/Inf and use fallback if needed
+            if np.isnan(Q) or np.isinf(Q) or Q < 0:
+                Q = last_valid_Q
+                n_errors += 1
+            else:
+                last_valid_Q = max(Q, 0.1)  # Update fallback
+            
+            outlet_Q.append(Q)
+        
+        router.stop_recording()
+        
+        if n_errors > 0:
+            print(f"  WARNING: Saint-Venant solver had {n_errors}/{ctx.n_timesteps} "
+                  f"timesteps with numerical issues (used fallback values)")
+        
+        outlet_Q = np.array(outlet_Q, dtype=np.float64)
+        
+        # Save for backward
+        ctx.save_for_backward(lateral_inflows, manning_n)
+        ctx.inflows_np = inflows_np
+        ctx.outlet_Q = outlet_Q
+        
+        return torch.tensor(outlet_Q, dtype=torch.float32, device=lateral_inflows.device)
+    
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """
+        Backward pass using Saint-Venant router's gradient computation.
+        Uses finite difference internally for Manning's n gradients.
+        """
+        lateral_inflows, manning_n = ctx.saved_tensors
+        
+        grad_np = grad_output.detach().cpu().numpy().astype(np.float64)
+        
+        # Compute gradients via the router's timeseries gradient function
+        # This uses finite difference on Manning's n internally
+        ctx.router.compute_gradients_timeseries(ctx.outlet_reach_id, grad_np.tolist())
+        
+        # Get gradients from router
+        grads_dict = ctx.router.get_gradients()
+        
+        # Map back to tensor in topological order
+        grad_manning_np = np.zeros(ctx.n_reaches, dtype=np.float64)
+        for i, rid in enumerate(ctx.topo_order_ids):
+            key = f"reach_{rid}_manning_n"
+            if key in grads_dict:
+                grad_manning_np[i] = grads_dict[key]
+        
+        grad_manning = torch.from_numpy(grad_manning_np.astype(np.float32))
+        
+        # Lateral inflow gradients (mass conservation approximation)
+        grad_lateral = grad_np[:, np.newaxis] * np.ones((1, ctx.n_reaches))
+        grad_lateral_t = torch.from_numpy(grad_lateral.astype(np.float32))
+        
+        return grad_lateral_t, grad_manning, None, None, None, None, None
+
 
 class DifferentiableRouting(torch.autograd.Function):
     """
@@ -438,6 +678,27 @@ class CoupledFUSERoute(nn.Module):
     Uses TRUE Enzyme AD for both FUSE and routing gradients.
     
     SPATIALLY VARYING: Each HRU has its own FUSE parameters.
+    
+    Args:
+        fuse_config: FUSE model configuration
+        topology_file: Path to topology.nc file
+        hru_areas: Array of HRU areas in m²
+        dt: Timestep in seconds (default: 86400.0 = 1 day)
+        warmup_steps: Number of warmup timesteps (default: 30)
+        spatial_params: Use spatially varying FUSE params (default: True)
+        routing_method: Routing method to use (default: 'muskingum_cunge')
+        
+            Differentiable methods (Manning's n is optimized):
+            - 'muskingum_cunge': Muskingum-Cunge with Enzyme AD (recommended, fastest)
+            - 'diffusive_wave': Diffusive wave approximation (analytical gradients)
+            - 'diffusive_wave_ift': Diffusive wave with IFT adjoint (exact gradients)
+            - 'irf': Impulse Response Function with soft-masked kernel
+            - 'kwt_soft': Soft-gated Kinematic Wave Tracking (differentiable parcels)
+            - 'saint_venant': Full dynamic Saint-Venant equations (CVODES/RK4, numerical gradients)
+            
+            Forward-only methods (Manning's n is NOT optimized):
+            - 'lag': Simple lag routing
+            - 'kwt': Kinematic Wave Tracking (mizuRoute compatible)
     """
     
     def __init__(self,
@@ -446,7 +707,8 @@ class CoupledFUSERoute(nn.Module):
                  hru_areas: np.ndarray,
                  dt: float = 86400.0,
                  warmup_steps: int = 30,
-                 spatial_params: bool = True):
+                 spatial_params: bool = True,
+                 routing_method: str = 'muskingum_cunge'):
         super().__init__()
         
         self.fuse_config = fuse_config
@@ -455,6 +717,17 @@ class CoupledFUSERoute(nn.Module):
         self.dt_days = dt / 86400.0
         self.warmup_steps = warmup_steps
         self.spatial_params = spatial_params
+        
+        # Validate and store routing method
+        routing_method = routing_method.lower()
+        if routing_method not in ROUTING_METHOD_INFO:
+            raise ValueError(f"Unknown routing_method '{routing_method}'. "
+                           f"Supported: {list(ROUTING_METHOD_INFO.keys())}")
+        
+        router_class_name, supports_gradients, gradient_method, config_class = ROUTING_METHOD_INFO[routing_method]
+        self.routing_method = routing_method
+        self.differentiable_routing = supports_gradients
+        self.gradient_method = gradient_method  # 'enzyme', 'native', 'sve', or None
         
         # Parameter bounds
         self.param_names = list(dfuse.PARAM_NAMES)
@@ -487,17 +760,63 @@ class CoupledFUSERoute(nn.Module):
         self.id_to_idx = {rid: i for i, rid in enumerate(topo_order)}
         self.outlet_reach_id = int(topo_order[-1])
         
-        # Create standard router for forward pass (EnzymeRouter has bugs)
-        config = dmc.RouterConfig()
-        config.dt = dt
-        config.num_substeps = 4
-        config.enable_gradients = False  # We use Enzyme AD instead
-        self.router = dmc.MuskingumCungeRouter(self.network, config)
+        # Create router config based on routing method
+        if routing_method == 'saint_venant':
+            # Full dynamic Saint-Venant uses its own config class
+            # NOTE: SVE is designed for sub-daily timesteps. Daily timesteps require
+            # relaxed tolerances and more internal steps.
+            config = dmc.SaintVenantConfig()
+            config.dt = dt
+            config.n_nodes = 10  # Spatial nodes per reach
+            
+            # Robust settings for daily timesteps (86400s is challenging for SVE)
+            config.rel_tol = 1e-3           # Relaxed relative tolerance (default: 1e-4)
+            config.abs_tol = 1e-4           # Relaxed absolute tolerance (default: 1e-6)
+            config.max_steps = 100000       # Many more internal steps (default: 5000)
+            
+            # Initial conditions - higher values for stability
+            config.initial_depth = 1.0      # Initial water depth [m] (default: 0.5)
+            config.initial_velocity = 0.5   # Initial velocity [m/s] (default: 0.1)
+            
+            # Stability - prevent dry bed numerical issues
+            config.min_depth = 0.05         # Minimum depth [m] (default: 0.01)
+            config.min_area = 0.5           # Minimum area [m²] (default: 0.1)
+            
+            config.enable_adjoint = True    # Enable gradient computation
+            
+            print(f"  NOTE: Saint-Venant with daily dt={dt}s requires relaxed tolerances.")
+            print(f"        Consider using 'diffusive_wave' for faster daily routing.")
+        else:
+            # Standard RouterConfig for other methods
+            config = dmc.RouterConfig()
+            config.dt = dt
+            config.num_substeps = 4
+            config.enable_gradients = supports_gradients and (gradient_method == 'native')
+            
+            # Configure method-specific settings
+            if routing_method in ['diffusive_wave', 'diffusive_wave_ift']:
+                config.dw_num_nodes = 10  # Spatial nodes per reach
+            elif routing_method == 'irf':
+                config.irf_shape_param = 2.5
+                config.irf_max_kernel_size = 500
+            elif routing_method == 'kwt_soft':
+                config.kwt_gate_steepness = 5.0  # Soft gate steepness
         
-        # Manning's n (log-space for positivity) with initial spatial variation
+        # Create the appropriate router
+        self.router = self._create_router(routing_method, config)
+        
+        # Manning's n - trainable for differentiable routing methods
         initial_log_n = torch.full((self.n_reaches,), np.log(0.035))
         initial_log_n = initial_log_n + torch.randn(self.n_reaches) * 0.1  # Add variation
-        self.log_manning_n = nn.Parameter(initial_log_n)
+        
+        if self.differentiable_routing:
+            # Trainable parameter
+            self.log_manning_n = nn.Parameter(initial_log_n)
+        else:
+            # Non-trainable buffer for forward-only methods
+            self.register_buffer('log_manning_n', initial_log_n)
+            print(f"  NOTE: Using '{routing_method}' routing (forward-only). "
+                  f"Manning's n will NOT be optimized.")
         
         # HRU to reach mapping
         self.register_buffer(
@@ -580,6 +899,25 @@ class CoupledFUSERoute(nn.Module):
         
         return mapping
     
+    def _create_router(self, routing_method: str, config):
+        """Create the appropriate router based on routing method."""
+        router_map = {
+            'muskingum_cunge': dmc.MuskingumCungeRouter,
+            'diffusive_wave': dmc.DiffusiveWaveRouter,
+            'diffusive_wave_ift': dmc.DiffusiveWaveIFT,
+            'irf': dmc.IRFRouter,
+            'kwt_soft': dmc.SoftGatedKWT,
+            'saint_venant': dmc.SaintVenantRouter,  # Full dynamic SVE
+            'lag': dmc.LagRouter,
+            'kwt': dmc.KWTRouter,
+        }
+        
+        router_class = router_map.get(routing_method)
+        if router_class is None:
+            raise ValueError(f"Unknown routing method: {routing_method}")
+        
+        return router_class(self.network, config)
+    
     def get_physical_params(self, hru_idx: Optional[int] = None) -> torch.Tensor:
         """
         Get physical parameters from unconstrained.
@@ -637,15 +975,85 @@ class CoupledFUSERoute(nn.Module):
         # Map to reaches (reorder to topological order)
         lateral_inflows = torch.matmul(runoff, self.mapping_matrix.T)
         
-        # Route using standard router + Enzyme AD for gradients
+        # Get Manning's n (from log-space)
         manning_n = torch.exp(self.log_manning_n)
-        outlet_Q = DifferentiableRouting.apply(
-            lateral_inflows, manning_n, 
-            self.router, self.network,
-            self.outlet_reach_id, self.dt_seconds
-        )
+        
+        # Dispatch to appropriate routing implementation based on gradient method
+        if self.gradient_method == 'enzyme':
+            # Muskingum-Cunge with Enzyme AD for gradients
+            outlet_Q = DifferentiableRouting.apply(
+                lateral_inflows, manning_n, 
+                self.router, self.network,
+                self.outlet_reach_id, self.dt_seconds
+            )
+        elif self.gradient_method == 'native':
+            # Use router's native gradient computation (IRF, DiffusiveWave, etc.)
+            outlet_Q = DifferentiableRoutingNative.apply(
+                lateral_inflows, manning_n,
+                self.router, self.network,
+                self.outlet_reach_id, self.dt_seconds,
+                self.reach_ids  # topo_order_ids
+            )
+        elif self.gradient_method == 'sve':
+            # Full dynamic Saint-Venant equations with numerical gradients
+            outlet_Q = DifferentiableRoutingSaintVenant.apply(
+                lateral_inflows, manning_n,
+                self.router, self.network,
+                self.outlet_reach_id, self.dt_seconds,
+                self.reach_ids  # topo_order_ids
+            )
+        else:
+            # Forward-only routing (no gradients through routing)
+            outlet_Q = self._forward_only_routing(lateral_inflows, manning_n)
         
         return outlet_Q, runoff
+    
+    def _forward_only_routing(self, lateral_inflows: torch.Tensor, 
+                              manning_n: torch.Tensor) -> torch.Tensor:
+        """
+        Forward-only routing without gradient computation.
+        
+        Used for routing methods that don't support differentiable optimization
+        (lag, kwt).
+        
+        Args:
+            lateral_inflows: [n_timesteps, n_reaches] in m³/s
+            manning_n: [n_reaches] Manning's n values
+            
+        Returns:
+            outlet_Q: [n_timesteps] Outlet discharge in m³/s
+        """
+        n_timesteps = lateral_inflows.shape[0]
+        
+        # Convert to numpy for C++ router
+        inflows_np = lateral_inflows.detach().cpu().numpy().astype(np.float64)
+        manning_np = manning_n.detach().cpu().numpy().astype(np.float64)
+        
+        # Update Manning's n on network
+        self.network.set_manning_n_all(manning_np)
+        
+        # Reset router state
+        self.router.reset_state()
+        
+        # Get topological order for setting inflows
+        topo_order = list(self.network.topological_order())
+        
+        # Route timestep by timestep
+        outlet_Q = []
+        for t in range(n_timesteps):
+            # Set lateral inflows for all reaches
+            for i, rid in enumerate(topo_order):
+                self.router.set_lateral_inflow(int(rid), float(inflows_np[t, i]))
+            
+            # Route one timestep
+            self.router.route_timestep()
+            
+            # Get outlet discharge
+            outlet_Q.append(self.router.get_discharge(self.outlet_reach_id))
+        
+        # Convert back to torch tensor (no gradients - detached from computational graph)
+        outlet_Q = np.array(outlet_Q, dtype=np.float64)
+        return torch.tensor(outlet_Q, dtype=torch.float32, device=lateral_inflows.device)
     
     def get_param_dict(self) -> Dict[str, float]:
         """Get current parameters (mean across HRUs if spatial)."""
@@ -1230,6 +1638,20 @@ def main():
     
     forcing, observed, topo_file, hru_areas = load_data(DATA_PATH)
     
+    # --- Choose routing method ---
+    # Differentiable methods (Manning's n is optimized):
+    #   'muskingum_cunge'    - Muskingum-Cunge with Enzyme AD (recommended, fastest)
+    #   'diffusive_wave'     - Diffusive wave approximation with analytical gradients
+    #   'diffusive_wave_ift' - Diffusive wave with IFT adjoint (exact gradients)
+    #   'irf'                - Impulse Response Function with soft-masked kernel
+    #   'kwt_soft'           - Soft-gated Kinematic Wave Tracking
+    #   'saint_venant'       - Full dynamic Saint-Venant equations (slowest, most physics)
+    #
+    # Forward-only methods (Manning's n is NOT optimized):
+    #   'lag'                - Simple lag routing
+    #   'kwt'                - Kinematic Wave Tracking (mizuRoute compatible)
+    ROUTING_METHOD = 'saint_venant'  # Change this to use different routing
+    
     print("\nInitializing model...")
     model = CoupledFUSERoute(
         fuse_config=dfuse.VIC_CONFIG,
@@ -1237,22 +1659,35 @@ def main():
         hru_areas=hru_areas,
         dt=86400.0,
         warmup_steps=365,  # 1 year spinup
-        spatial_params=True  # Spatially varying FUSE parameters
+        spatial_params=True,  # Spatially varying FUSE parameters
+        routing_method=ROUTING_METHOD
     )
     
     # Count total parameters
     n_fuse_params = model.n_hrus * len(model.param_names) if model.spatial_params else len(model.param_names)
-    n_manning_params = model.n_reaches
+    n_manning_params = model.n_reaches if model.differentiable_routing else 0
     n_total = n_fuse_params + n_manning_params
     
+    print(f"  Routing method: {model.routing_method}")
+    print(f"  Differentiable routing: {model.differentiable_routing}")
+    if model.differentiable_routing:
+        gradient_desc = {
+            'enzyme': 'Enzyme AD (reverse-mode)',
+            'native': 'Native router AD',
+            'sve': 'Saint-Venant numerical gradients (finite difference)'
+        }
+        print(f"  Gradient method: {gradient_desc.get(model.gradient_method, model.gradient_method)}")
     print(f"  FUSE param types: {len(model.param_names)}")
     print(f"  Reaches: {model.n_reaches}")
     print(f"  HRUs: {model.n_hrus}")
     print(f"  Spatially varying: {model.spatial_params}")
     print(f"  Total optimizable parameters: {n_total}")
     print(f"    - FUSE: {n_fuse_params} ({model.n_hrus} HRUs × {len(model.param_names)} params)")
-    print(f"    - Manning's n: {n_manning_params}")
-    print(f"  Using Enzyme AD for routing gradients")
+    if model.differentiable_routing:
+        print(f"    - Manning's n: {n_manning_params} (trainable)")
+    else:
+        print(f"    - Manning's n: {model.n_reaches} (fixed, not optimized)")
+        print(f"  Routing is forward-only (no gradient computation)")
     if model.spatial_params:
         print(f"  ⚠ NOTE: Spatial params = slower training (~{model.n_hrus}x per epoch)")
     manning_init = torch.exp(model.log_manning_n).detach().numpy()
@@ -1277,7 +1712,6 @@ def main():
     loss.backward()
     
     fuse_grad = model.fuse_raw_params.grad
-    manning_grad = model.log_manning_n.grad
     
     if fuse_grad is not None and (fuse_grad != 0).any():
         print("  ✓ FUSE gradients flowing")
@@ -1286,11 +1720,16 @@ def main():
     else:
         print("  ✗ FUSE gradients NOT flowing!")
     
-    if manning_grad is not None and (manning_grad != 0).any():
-        print("  ✓ Manning gradients flowing (Enzyme AD)")
-        print(f"    grad sum: {manning_grad.sum().item():.6f}, max: {manning_grad.abs().max().item():.6f}")
+    if model.differentiable_routing:
+        manning_grad = model.log_manning_n.grad
+        if manning_grad is not None and (manning_grad != 0).any():
+            grad_method_str = "Enzyme AD" if model.gradient_method == 'enzyme' else "Native router AD"
+            print(f"  ✓ Manning gradients flowing ({grad_method_str})")
+            print(f"    grad sum: {manning_grad.sum().item():.6f}, max: {manning_grad.abs().max().item():.6f}")
+        else:
+            print("  ✗ Manning gradients NOT flowing!")
     else:
-        print("  ✗ Manning gradients NOT flowing!")
+        print(f"  ℹ Manning's n not optimized (using {model.routing_method} forward-only routing)")
     
     # Plot initial state
     print("\n" + "="*60)
@@ -1307,7 +1746,7 @@ def main():
         forcing=forcing,
         observed=observed,
         n_epochs=600,           # More epochs for complex loss
-        lr=0.025,                # Learning rate
+        lr=0.03,                # Learning rate
         loss_fn='triple',       # NSE + log-NSE + peak-weighted
         alpha=0.6,              # Not used for triple, but kept for reference
         spatial_reg=0.0005,     # Slightly less regularization

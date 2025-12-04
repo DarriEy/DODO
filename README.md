@@ -1,5 +1,9 @@
 # DODO: Differentiable Optimization of Distributed Outflow
 
+<p align="center">
+  <img src="src/logo/Dodo_Logo.jpg" alt="DODO logo" width="300" />
+</p>
+
 **DODO** is an end-to-end differentiable framework for calibrating distributed hydrological models with river routing. It couples [dFUSE](https://github.com/DarriEy/dFUSE) (differentiable FUSE) with [dRoute](https://github.com/DarriEy/dRoute) (differentiable Muskingum-Cunge routing) to enable gradient-based optimization of both rainfall-runoff parameters and channel routing parameters simultaneously.
 
 ## Key Features
@@ -18,39 +22,39 @@
 │                         DODO Framework                          │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────┐ │
-│  │   Forcing   │───▶│    dFUSE    │───▶│   Runoff [mm/day]   │ │
-│  │ [P, PET, T] │    │  (per HRU)  │    │   per HRU           │ │
-│  └─────────────┘    └─────────────┘    └──────────┬──────────┘ │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────┐  │
+│  │   Forcing   │───▶│    dFUSE    │───▶│   Runoff [mm/day]   │  │
+│  │ [P, PET, T] │    │  (per HRU)  │    │   per HRU           │  │
+│  └─────────────┘    └─────────────┘    └──────────┬──────────┘  │
 │                            ▲                      │             │
 │                            │                      ▼             │
 │                    ┌───────┴───────┐    ┌─────────────────────┐ │
 │                    │ FUSE Params   │    │  HRU→Reach Mapping  │ │
 │                    │ [n_hru × 29]  │    │  (area conversion)  │ │
 │                    └───────────────┘    └──────────┬──────────┘ │
-│                                                    │             │
-│                                                    ▼             │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────┐ │
-│  │  Observed Q │◀───│   dRoute    │◀───│ Lateral Inflows     │ │
-│  │  [m³/s]     │    │ (Musk-Cunge)│    │ [m³/s] per reach    │ │
-│  └──────┬──────┘    └─────────────┘    └─────────────────────┘ │
+│                                                    │            │
+│                                                    ▼            │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────┐  │
+│  │  Observed Q │◀───│   dRoute    │◀───│ Lateral Inflows     │  │
+│  │  [m³/s]     │    │ (Musk-Cunge)│    │ [m³/s] per reach    │  │
+│  └──────┬──────┘    └─────────────┘    └─────────────────────┘  │
 │         │                  ▲                                    │
 │         │                  │                                    │
-│         │          ┌───────┴───────┐                           │
-│         │          │  Manning's n  │                           │
-│         │          │  [n_reaches]  │                           │
-│         │          └───────────────┘                           │
+│         │          ┌───────┴───────┐                            │
+│         │          │  Manning's n  │                            │
+│         │          │  [n_reaches]  │                            │
+│         │          └───────────────┘                            │
 │         │                                                       │
 │         ▼                                                       │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │              Loss Function (NSE, KGE, etc.)             │   │
-│  └─────────────────────────────────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │              Loss Function (NSE, KGE, etc.)             │    │
+│  └─────────────────────────────────────────────────────────┘    │
 │         │                                                       │
-│         │  Backpropagation (Enzyme AD)                         │
+│         │  Backpropagation (Enzyme AD)                          │
 │         ▼                                                       │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │           Parameter Updates (Adam optimizer)             │   │
-│  └─────────────────────────────────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │           Parameter Updates (Adam optimizer)            │    │
+│  └─────────────────────────────────────────────────────────┘    │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
