@@ -222,14 +222,17 @@ def triple_objective_loss(sim: torch.Tensor, obs: torch.Tensor,
 # Routing method configurations
 # Format: (router_class_name, supports_gradients, gradient_method, config_class)
 # gradient_method: 'enzyme' = use Enzyme AD, 'native' = use router's built-in AD, 
-#                  'sve' = Saint-Venant specific gradient API, None = forward-only
+#                  'sve' = Saint-Venant specific gradient API, 
+#                  'sve_enzyme' = Saint-Venant with Enzyme+CVODES adjoint,
+#                  None = forward-only
 ROUTING_METHOD_INFO = {
     'muskingum_cunge': ('MuskingumCungeRouter', True, 'enzyme', 'RouterConfig'),
     'diffusive_wave': ('DiffusiveWaveRouter', True, 'native', 'RouterConfig'),    # Diffusive wave approx
     'diffusive_wave_ift': ('DiffusiveWaveIFT', True, 'native', 'RouterConfig'),   # Diffusive wave with IFT adjoint
     'irf': ('IRFRouter', True, 'native', 'RouterConfig'),                          # Impulse Response Function
     'kwt_soft': ('SoftGatedKWT', True, 'native', 'RouterConfig'),                  # Differentiable KWT
-    'saint_venant': ('SaintVenantRouter', True, 'sve', 'SaintVenantConfig'),       # Full dynamic Saint-Venant
+    'saint_venant': ('SaintVenantRouter', True, 'sve', 'SaintVenantConfig'),       # Full dynamic Saint-Venant (FD gradients)
+    'saint_venant_enzyme': ('SaintVenantEnzyme', True, 'sve_enzyme', 'SaintVenantEnzymeConfig'),  # SVE + Enzyme AD
     'lag': ('LagRouter', False, None, 'RouterConfig'),                             # Forward-only
     'kwt': ('KWTRouter', False, None, 'RouterConfig'),                             # Forward-only
 }
@@ -455,6 +458,128 @@ class DifferentiableRoutingSaintVenant(torch.autograd.Function):
         # Lateral inflow gradients (mass conservation approximation)
         grad_lateral = grad_np[:, np.newaxis] * np.ones((1, ctx.n_reaches))
         grad_lateral_t = torch.from_numpy(grad_lateral.astype(np.float32))
+        
+        return grad_lateral_t, grad_manning, None, None, None, None, None
+
+
+class DifferentiableRoutingSaintVenantEnzyme(torch.autograd.Function):
+    """
+    PyTorch wrapper for the Enzyme-enabled Saint-Venant router.
+    
+    Uses CVODES adjoint sensitivity with Enzyme AD for efficient gradients:
+    - Forward: CVODES BDF with Enzyme-computed Jacobian
+    - Backward: CVODES adjoint with Enzyme-computed J^T λ products
+    - Gradients: Accumulated via ∫ λ^T (∂f/∂p) dt
+    
+    This is significantly faster than finite difference for gradient computation.
+    """
+    
+    @staticmethod
+    def forward(ctx, 
+                lateral_inflows: torch.Tensor,  # [n_timesteps, n_reaches]
+                manning_n: torch.Tensor,         # [n_reaches]
+                router,                          # dmc.SaintVenantEnzyme
+                network,                         # dmc.Network
+                outlet_reach_id: int,            # Reach ID of outlet
+                dt: float,                       # Timestep in seconds
+                topo_order_ids: list) -> torch.Tensor:
+        """
+        Route lateral inflows through river network using Saint-Venant + Enzyme.
+        
+        Returns outlet discharge [n_timesteps].
+        """
+        ctx.router = router
+        ctx.network = network
+        ctx.outlet_reach_id = outlet_reach_id
+        ctx.n_reaches = lateral_inflows.shape[1]
+        ctx.n_timesteps = lateral_inflows.shape[0]
+        ctx.dt = dt
+        ctx.topo_order_ids = topo_order_ids
+        
+        inflows_np = lateral_inflows.detach().cpu().numpy().astype(np.float64)
+        manning_np = manning_n.detach().cpu().numpy().astype(np.float64)
+        
+        # Ensure non-negative inflows
+        inflows_np = np.maximum(inflows_np, 0.0)
+        
+        # Update Manning's n on network
+        network.set_manning_n_all(manning_np)
+        
+        # Reset router state and start recording for adjoint
+        router.reset_state()
+        router.start_recording()
+        
+        # Forward pass with CVODES checkpointing
+        outlet_Q = []
+        last_valid_Q = 0.1
+        n_errors = 0
+        
+        for t in range(ctx.n_timesteps):
+            for i, rid in enumerate(topo_order_ids):
+                inflow = max(float(inflows_np[t, i]), 1e-6)
+                router.set_lateral_inflow(int(rid), inflow)
+            
+            router.route_timestep()
+            
+            Q = router.get_discharge(outlet_reach_id)
+            
+            if np.isnan(Q) or np.isinf(Q) or Q < 0:
+                Q = last_valid_Q
+                n_errors += 1
+            else:
+                last_valid_Q = max(Q, 0.1)
+            
+            outlet_Q.append(Q)
+        
+        router.stop_recording()
+        
+        if n_errors > 0:
+            print(f"  WARNING: SVE-Enzyme solver had {n_errors}/{ctx.n_timesteps} "
+                  f"timesteps with numerical issues")
+        
+        outlet_Q = np.array(outlet_Q, dtype=np.float64)
+        
+        # Save for backward
+        ctx.save_for_backward(lateral_inflows, manning_n)
+        ctx.inflows_np = inflows_np
+        ctx.outlet_Q = outlet_Q
+        
+        return torch.tensor(outlet_Q, dtype=torch.float32, device=lateral_inflows.device)
+    
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """
+        Backward pass using CVODES adjoint + Enzyme AD.
+        
+        This computes exact gradients via:
+        1. Backward integration: λ' = -J^T λ (Enzyme provides J^T λ)
+        2. Accumulation: dL/dp = ∫ λ^T (∂f/∂p) dt (Enzyme provides ∂f/∂p)
+        """
+        lateral_inflows, manning_n = ctx.saved_tensors
+        
+        grad_np = grad_output.detach().cpu().numpy().astype(np.float64)
+        
+        # Compute gradients via CVODES adjoint + Enzyme
+        ctx.router.compute_gradients(ctx.outlet_reach_id, grad_np.tolist())
+        
+        # Get gradients from router
+        grads_dict = ctx.router.get_gradients()
+        
+        # Map back to tensor in topological order
+        grad_manning_np = np.zeros(ctx.n_reaches, dtype=np.float64)
+        for i, rid in enumerate(ctx.topo_order_ids):
+            key = f"reach_{rid}_manning_n"
+            if key in grads_dict:
+                grad_manning_np[i] = grads_dict[key]
+        
+        grad_manning = torch.from_numpy(grad_manning_np.astype(np.float32))
+        
+        # Lateral inflow gradients (would need additional adjoint for these)
+        grad_lateral = grad_np[:, np.newaxis] * np.ones((1, ctx.n_reaches))
+        grad_lateral_t = torch.from_numpy(grad_lateral.astype(np.float32))
+        
+        # Reset for next iteration
+        ctx.router.reset_gradients()
         
         return grad_lateral_t, grad_manning, None, None, None, None, None
 
@@ -694,7 +819,8 @@ class CoupledFUSERoute(nn.Module):
             - 'diffusive_wave_ift': Diffusive wave with IFT adjoint (exact gradients)
             - 'irf': Impulse Response Function with soft-masked kernel
             - 'kwt_soft': Soft-gated Kinematic Wave Tracking (differentiable parcels)
-            - 'saint_venant': Full dynamic Saint-Venant equations (CVODES/RK4, numerical gradients)
+            - 'saint_venant': Full dynamic Saint-Venant equations (numerical gradients)
+            - 'saint_venant_enzyme': Full SVE with Enzyme AD + CVODES adjoint (exact gradients)
             
             Forward-only methods (Manning's n is NOT optimized):
             - 'lag': Simple lag routing
@@ -786,6 +912,34 @@ class CoupledFUSERoute(nn.Module):
             
             print(f"  NOTE: Saint-Venant with daily dt={dt}s requires relaxed tolerances.")
             print(f"        Consider using 'diffusive_wave' for faster daily routing.")
+            
+        elif routing_method == 'saint_venant_enzyme':
+            # Enzyme-enabled Saint-Venant with CVODES adjoint
+            config = dmc.SaintVenantEnzymeConfig()
+            config.dt = dt
+            config.n_nodes = 10  # Spatial nodes per reach
+            
+            # Tolerances (Enzyme provides exact Jacobian so can be tighter)
+            config.rel_tol = 1e-4
+            config.abs_tol = 1e-6
+            config.max_steps = 50000
+            
+            # Initial conditions
+            config.initial_depth = 1.0
+            config.initial_velocity = 0.5
+            config.min_depth = 0.05
+            config.min_area = 0.5
+            
+            # Enzyme-specific settings
+            config.use_enzyme_jacobian = True   # Enzyme for Jacobian
+            config.use_enzyme_adjoint = True    # Enzyme for adjoint RHS
+            config.adjoint_checkpoint_steps = 100  # Checkpointing interval
+            config.enable_adjoint = True
+            
+            print(f"  Saint-Venant with Enzyme AD for exact gradients")
+            print(f"    - Enzyme Jacobian: {config.use_enzyme_jacobian}")
+            print(f"    - Enzyme Adjoint: {config.use_enzyme_adjoint}")
+            print(f"    - Checkpoint interval: {config.adjoint_checkpoint_steps}")
         else:
             # Standard RouterConfig for other methods
             config = dmc.RouterConfig()
@@ -908,6 +1062,7 @@ class CoupledFUSERoute(nn.Module):
             'irf': dmc.IRFRouter,
             'kwt_soft': dmc.SoftGatedKWT,
             'saint_venant': dmc.SaintVenantRouter,  # Full dynamic SVE
+            'saint_venant_enzyme': dmc.SaintVenantEnzyme,  # SVE + Enzyme AD
             'lag': dmc.LagRouter,
             'kwt': dmc.KWTRouter,
         }
@@ -997,6 +1152,14 @@ class CoupledFUSERoute(nn.Module):
         elif self.gradient_method == 'sve':
             # Full dynamic Saint-Venant equations with numerical gradients
             outlet_Q = DifferentiableRoutingSaintVenant.apply(
+                lateral_inflows, manning_n,
+                self.router, self.network,
+                self.outlet_reach_id, self.dt_seconds,
+                self.reach_ids  # topo_order_ids
+            )
+        elif self.gradient_method == 'sve_enzyme':
+            # Saint-Venant with Enzyme AD + CVODES adjoint for exact gradients
+            outlet_Q = DifferentiableRoutingSaintVenantEnzyme.apply(
                 lateral_inflows, manning_n,
                 self.router, self.network,
                 self.outlet_reach_id, self.dt_seconds,
@@ -1640,17 +1803,18 @@ def main():
     
     # --- Choose routing method ---
     # Differentiable methods (Manning's n is optimized):
-    #   'muskingum_cunge'    - Muskingum-Cunge with Enzyme AD (recommended, fastest)
-    #   'diffusive_wave'     - Diffusive wave approximation with analytical gradients
-    #   'diffusive_wave_ift' - Diffusive wave with IFT adjoint (exact gradients)
-    #   'irf'                - Impulse Response Function with soft-masked kernel
-    #   'kwt_soft'           - Soft-gated Kinematic Wave Tracking
-    #   'saint_venant'       - Full dynamic Saint-Venant equations (slowest, most physics)
+    #   'muskingum_cunge'       - Muskingum-Cunge with Enzyme AD (recommended, fastest)
+    #   'diffusive_wave'        - Diffusive wave approximation with analytical gradients
+    #   'diffusive_wave_ift'    - Diffusive wave with IFT adjoint (exact gradients)
+    #   'irf'                   - Impulse Response Function with soft-masked kernel
+    #   'kwt_soft'              - Soft-gated Kinematic Wave Tracking
+    #   'saint_venant'          - Full dynamic SVE (numerical gradients, slow)
+    #   'saint_venant_enzyme'   - Full dynamic SVE with Enzyme AD (exact gradients)
     #
     # Forward-only methods (Manning's n is NOT optimized):
-    #   'lag'                - Simple lag routing
-    #   'kwt'                - Kinematic Wave Tracking (mizuRoute compatible)
-    ROUTING_METHOD = 'saint_venant'  # Change this to use different routing
+    #   'lag'                   - Simple lag routing
+    #   'kwt'                   - Kinematic Wave Tracking (mizuRoute compatible)
+    ROUTING_METHOD = 'diffusive_wave'  # Change this to use different routing
     
     print("\nInitializing model...")
     model = CoupledFUSERoute(
@@ -1674,7 +1838,8 @@ def main():
         gradient_desc = {
             'enzyme': 'Enzyme AD (reverse-mode)',
             'native': 'Native router AD',
-            'sve': 'Saint-Venant numerical gradients (finite difference)'
+            'sve': 'Saint-Venant numerical gradients (finite difference)',
+            'sve_enzyme': 'Saint-Venant Enzyme AD + CVODES adjoint (exact)'
         }
         print(f"  Gradient method: {gradient_desc.get(model.gradient_method, model.gradient_method)}")
     print(f"  FUSE param types: {len(model.param_names)}")
