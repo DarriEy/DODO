@@ -26,8 +26,8 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install cfuse
-        pip install git+https://github.com/DarriEy/dRoute.git@v0.5.0
+        pip install --no-cache-dir cfuse
+        pip install --no-cache-dir droute || pip install --no-cache-dir git+https://github.com/DarriEy/dRoute.git@v0.5.1
         pip install -e .
 
     - name: Run DODO example (smoke)
