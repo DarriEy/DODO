@@ -1,0 +1,8 @@
+include README.md
+include LICENSE
+include pyproject.toml
+include setup.py
+recursive-include python *.py
+prune data
+prune outputs
+global-exclude *.pyc *.pyo __pycache__

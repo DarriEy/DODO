@@ -4,7 +4,7 @@
   <img src="src/logo/Dodo_Logo.jpg" alt="DODO logo" width="300" />
 </p>
 
-**DODO** is an end-to-end differentiable framework for calibrating distributed hydrological models with river routing. It couples [dFUSE](https://github.com/DarriEy/dFUSE) (differentiable FUSE) with [dRoute](https://github.com/DarriEy/dRoute) (differentiable Muskingum-Cunge routing) to enable gradient-based optimization of both rainfall-runoff parameters and channel routing parameters simultaneously.
+**DODO** is an end-to-end differentiable framework for calibrating distributed hydrological models with river routing. It couples [cFUSE](https://github.com/DarriEy/cFUSE) (differentiable FUSE) with [dRoute](https://github.com/DarriEy/dRoute) (differentiable Muskingum-Cunge routing) to enable gradient-based optimization of both rainfall-runoff parameters and channel routing parameters simultaneously.
 
 ## Key Features
 
@@ -23,7 +23,7 @@
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
 │  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────┐  │
-│  │   Forcing   │───▶│    dFUSE    │───▶│   Runoff [mm/day]   │  │
+│  │   Forcing   │───▶│    cFUSE    │───▶│   Runoff [mm/day]   │  │
 │  │ [P, PET, T] │    │  (per HRU)  │    │   per HRU           │  │
 │  └─────────────┘    └─────────────┘    └──────────┬──────────┘  │
 │                            ▲                      │             │
@@ -63,26 +63,19 @@
 
 ### Prerequisites
 
-1. **dFUSE** - Differentiable FUSE implementation
+1. **cFUSE** - Differentiable FUSE implementation
    ```bash
-   git clone https://github.com/DarriEy/dFUSE.git
-   cd dFUSE && mkdir build && cd build
-   cmake .. -DDFUSE_USE_ENZYME=ON
-   make -j4
-   pip install -e ../python
+   pip install cfuse
    ```
 
 2. **dRoute** - Differentiable river routing
    ```bash
-   git clone https://github.com/DarriEy/dRoute.git
-   cd dRoute && mkdir build && cd build
-   cmake .. -DDMC_USE_ENZYME=ON
-   make -j4
+   pip install droute
    ```
 
 3. **Python dependencies**
    ```bash
-   pip install torch numpy xarray pandas geopandas matplotlib
+   pip install torch numpy xarray pandas matplotlib netCDF4
    ```
 
 ### DODO Setup
@@ -90,32 +83,46 @@
 ```bash
 git clone https://github.com/DarriEy/DODO.git
 cd DODO
+pip install -e .
+```
 
-# Update paths in run_coupled_optimization.py:
-# - CODE_DIR: Path to dFUSE and dRoute
-# - DATA_PATH: Path to your domain data
+For a packaged install:
+
+```bash
+pip install dodo-hydro
+```
+
+To enable plotting with shapefiles:
+
+```bash
+pip install dodo-hydro[plots]
 ```
 
 ## Quick Start
 
 To run the example:
 
+```bash
+dodo-optimize --data-path data/domain_Bow_at_Banff_distributed --epochs 1 --no-plots
 ```
-python run_coupled_optimization.py
-```
+
+The runner resolves the data path in this order:
+1) `--data-path`
+2) `DODO_DATA_PATH` env var
+3) `./data/domain_Bow_at_Banff_distributed` (repo checkout)
 
 To use in workflows:
 
 ```python
-from run_coupled_optimization import CoupledFUSERoute, train_model, load_data
-import dfuse
+from dodo.run_coupled_optimization import CoupledFUSERoute, train_model, load_data
+import cfuse
 
 # Load data
 forcing, observed, topo_file, hru_areas = load_data(DATA_PATH)
 
 # Initialize coupled model
 model = CoupledFUSERoute(
-    fuse_config=dfuse.VIC_CONFIG,
+    fuse_config=cfuse.VIC_CONFIG,
     topology_file=topo_file,
     hru_areas=hru_areas,
     dt=86400.0,              # Daily timestep
@@ -150,6 +157,11 @@ DODO provides multiple loss functions for different calibration objectives:
 | `peak_weighted` | NSE with 3x weight on high flows | Peak capture |
 
 ## Data Requirements
+
+Example data is distributed as a release asset starting with `v0.1.0`.
+Download the Bow-at-Banff distributed dataset from
+https://github.com/DarriEy/DODO/releases/tag/v0.1.0 and extract it so the path
+is `data/domain_Bow_at_Banff_distributed/` before running the example.
 
 ### Directory Structure
 ```
@@ -186,6 +198,6 @@ domain_name/
 
 ## Related Repositories
 
-- **[dFUSE](https://github.com/DarriEy/dFUSE)**: Differentiable implementation of FUSE (Clark et al., 2008)
+- **[cFUSE](https://github.com/DarriEy/cFUSE)**: Differentiable implementation of FUSE (Clark et al., 2008)
 - **[dRoute](https://github.com/DarriEy/dRoute)**: Differentiable Muskingum-Cunge river routing
 - **[CONFLUENCE/SYMFLUENCE](https://github.com/DarriEy/SYMFLUENCE)**: Comprehensive hydrological modeling framework
