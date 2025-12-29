@@ -1,5 +1,9 @@
 # DODO: Differentiable Optimization of Distributed Outflow
 
+[![CI](https://github.com/DarriEy/DODO/actions/workflows/ci.yml/badge.svg)](https://github.com/DarriEy/DODO/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.9%20to%203.12-blue.svg)](https://www.python.org/downloads/)
+
 <p align="center">
   <img src="src/logo/Dodo_Logo.jpg" alt="DODO logo" width="300" />
 </p>
